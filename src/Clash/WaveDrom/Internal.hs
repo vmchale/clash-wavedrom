@@ -13,7 +13,9 @@ import           Clash.Prelude           hiding ( (++)
                                                 , fromList
                                                 , replicate
                                                 , undefined
+                                                , sampleN_lazy
                                                 )
+import           Clash.Explicit.Prelude         ( sampleN_lazy )
 import           Control.DeepSeq
 import           Control.Lens                   ( transform )
 import           Data.Aeson
@@ -34,24 +36,31 @@ import           Data.Maybe                     ( catMaybes
                                                 )
 import           Data.Monoid                    ( Ap(..) )
 import           Data.Proxy
-import           Data.Singletons.Prelude.Enum
-import           Data.Singletons.Prelude.List   ( (%++)
+import           Data.Singletons.Base.Enum
+import           Data.Foldable.Singletons       ( sFoldr
+                                                )
+import           Data.List.Singletons           ( (%++)
                                                 , type (++)
                                                 , type (++@#@$)
                                                 , Map
                                                 , SList(SCons, SNil)
-                                                , sFoldr
                                                 , sMap
                                                 )
-import           Data.Singletons.Prelude.Num    ( type (+@#@$)
+import           Prelude.Singletons             ( type (+@#@$)
                                                 , type (-@#@$)
+                                                , type (:@#@$)
+                                                , type (==@#@$)
+                                                , (%==)
                                                 , SNum(..)
+                                                , SBool(..)
+                                                , FromInteger
+                                                , NilSym0
                                                 )
-import           Data.Singletons.Prelude.Proxy  ( SProxy(SProxy) )
-import           Data.Singletons.Prelude.Show
+import           Data.Proxy.Singletons          ( SProxy(SProxy) )
+import           Text.Show.Singletons
 import           Data.Singletons.TH      hiding ( type (<=) )
-import qualified Data.Singletons.TypeLits
-import           Data.Singletons.TypeLits       ( SSymbol(SSym) )
+import qualified GHC.TypeLits.Singletons
+import           GHC.TypeLits.Singletons        ( SSymbol(SSym) )
 import qualified Data.Text                     as T
 import           Data.Text               hiding ( foldr1
                                                 , group
@@ -61,7 +70,6 @@ import           Data.Text               hiding ( foldr1
 import           Data.Type.Equality
 import           Data.Vector                    ( fromList )
 import qualified Data.Vector                   as V
-import           Debug.Trace
 import           GHC.Generics
 import           GHC.TypeLits
 import           Unsafe.Coerce
@@ -308,10 +316,42 @@ newtype WithBits a = WithBits { unWithBits :: a }
   deriving (Generic, Show)
   deriving anyclass (NFData, NFDataX, ShowX)
 
+--
+-- Vec, along with some nonsense to get singletons to write indexedDsc.
+--
+
+type WaveShapeP (p :: Proxy a) n = WaveShape a n
+$(genDefunSymbols [''WaveShapeP])
+
+$(singletonsOnly [d|
+  indexedDsc :: ToWave a => Proxy a -> Nat -> [T]
+  indexedDsc a i = if i == 0
+             then []
+             else waveShapeP a (show_ (i - 1)) : indexedDsc a (i-1)
+  |])
+
 instance (NFData a, Show a) => ToWave (ShowWave a) where
   type WaveShape (ShowWave a) = L
   toWave = xInstantLeaf $ Single . Instant '=' . Just . tShow . unShowWave
   waveShape _ SSym = sing
+
+instance (KnownNat n, ToWave a) => ToWave (Vec n a) where
+  type WaveShape (Vec n a) = B (IndexedDsc ( 'Proxy :: Proxy a) n)
+  toWave
+    :: forall s
+     . KnownSymbol s
+    => Vec n a
+    -> Waves (WaveShape (Vec n a) s) Instant
+  toWave v = case isX v of
+    Left _ -> withSingI (waveShape (Proxy @(Vec n a)) (sing @s))
+      $ pure (Instant 'x' Nothing)
+    Right v' -> vecToWave @n (Clash.reverse v')
+  waveShape _ s = SBranch (sIndexedDsc (SProxy @a) (sing @n)) s
+
+instance KnownNat n => ToWave (BitVector n) where
+  type WaveShape (BitVector n) = WaveShape (Vec n Bit)
+  toWave = toWave @(Vec n Bit) . Clash.Prelude.reverse . Clash.Prelude.bv2v
+  waveShape _ = waveShape (Proxy @(Vec n Bit))
 
 instance (NFData a, BitPack a, KnownNat (BitSize a)) => ToWave (BitsWave a) where
   type WaveShape (BitsWave a) = WaveShape (BitVector (BitSize a))
@@ -394,10 +434,6 @@ instance (KnownSymbol lName, KnownSymbol rName, ToWave l, ToWave r) => ToWave (N
     )
 
 
---
--- Vec, along with some nonsense to get singletons to write indexedDsc.
---
-
 type SToWave = ToWave
 
 sWaveShapeP
@@ -407,16 +443,6 @@ sWaveShapeP
   -> Sing (n :: Symbol)
   -> Sing (WaveShape a n)
 sWaveShapeP _ = waveShape (Proxy @a)
-
-type WaveShapeP (p :: Proxy a) n = WaveShape a n
-$(genDefunSymbols [''WaveShapeP])
-
-$(singletonsOnly [d|
-  indexedDsc :: ToWave a => Proxy a -> Nat -> [T]
-  indexedDsc a i = if i == 0
-             then []
-             else waveShapeP a (show_ (i - 1)) : indexedDsc a (i-1)
-  |])
 
 -- | The positive case of the @IndexedDsc@ equation
 indexedDscPositive
@@ -437,24 +463,6 @@ vecToWave = \case
   Clash.Cons v vs -> case indexedDscPositive @a @i Proxy of
     Refl -> case sShow_ (sing @(i - 1)) of
       SSym -> toWave v `Cons` vecToWave @(i - 1) vs
-
-instance (KnownNat n, ToWave a) => ToWave (Vec n a) where
-  type WaveShape (Vec n a) = B (IndexedDsc ( 'Proxy :: Proxy a) n)
-  toWave
-    :: forall s
-     . KnownSymbol s
-    => Vec n a
-    -> Waves (WaveShape (Vec n a) s) Instant
-  toWave v = case isX v of
-    Left _ -> withSingI (waveShape (Proxy @(Vec n a)) (sing @s))
-      $ pure (Instant 'x' Nothing)
-    Right v' -> vecToWave @n (Clash.reverse v')
-  waveShape _ s = SBranch (sIndexedDsc (SProxy @a) (sing @n)) s
-
-instance KnownNat n => ToWave (BitVector n) where
-  type WaveShape (BitVector n) = WaveShape (Vec n Bit)
-  toWave = toWave @(Vec n Bit) . Clash.Prelude.reverse . Clash.Prelude.bv2v
-  waveShape _ = waveShape (Proxy @(Vec n Bit))
 
 deriving via ShowWave (Unsigned n) instance ToWave (Unsigned n)
 deriving via ShowWave (Index n) instance ToWave (Index n)
@@ -540,4 +548,4 @@ signalToWave n =
    simplify
   . foldr1 (<>)
   . fmap (fmap pure . toWave @_ @n)
-  . sampleN_lazy @dom n
+  . sampleN_lazy n

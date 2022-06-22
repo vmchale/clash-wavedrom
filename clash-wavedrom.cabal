@@ -47,6 +47,7 @@ library
     , lens
     , lens-aeson
     , singletons
+    , singletons-base
     , temporary
     , text
     , typed-process
